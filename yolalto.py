@@ -253,10 +253,12 @@ def save_alto_xml(alto_element: etree._Element, output_path: str):
 @click.argument('image_paths', type=click.Path(exists=True, path_type=Path), nargs=-1)
 @click.argument('model_path', type=click.Path(exists=True, path_type=Path))
 @click.option('-b', '--batch-size', default=4, help="Batch size for processing images.")
-def cli(image_paths: tuple[Path], model_path: Path, batch_size: int = 4):
+@click.option("-d", "--device", default=None, help="Device to use")
+def cli(image_paths: tuple[Path], model_path: Path, batch_size: int = 4, device: str = None):
     """Generate ALTO XML from multiple images using a YOLOv8 model."""
     model = load_model(str(model_path))
-
+    if device:
+        model.to(device)
     if batch_size:
         image_paths = list(image_paths)  # Convert to list for easier batching
         num_batches = len(image_paths) // batch_size + (1 if len(image_paths) % batch_size else 0)
