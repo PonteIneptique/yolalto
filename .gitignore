@@ -2,3 +2,5 @@ env
 mss
 .ipynb_checkpoints
 .idea
+*.jpeg
+*.xml

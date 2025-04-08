@@ -4,13 +4,18 @@ Requirements: `shapely`, `ultralytics`, `lxml`, `click`
 from ultralytics import YOLO
 from lxml import etree
 import itertools
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Callable
 import uuid
 import os
 import hashlib
 import click
 from pathlib import Path
 import math
+import numpy as np
+from sklearn import preprocessing
+from sklearn.cluster import DBSCAN
+import functools
+
 
 
 def sort_by_top_left_distance(bbox_objects: List[Dict]) -> List[Dict]:
@@ -44,7 +49,7 @@ def create_tag_id(label: str, prefix: str) -> str:
     return f"{prefix}{numeric_part}"
 
     
-def run_inference(model: YOLO, images_path: List[str]) -> List[Tuple[Dict, Tuple[int, int]]]:
+def run_inference(model: YOLO, images_path: List[str]) -> List[Tuple[List[Dict], Tuple[int, int]]]:
     """Run YOLO on an image and return parsed predictions."""
     results = model(images_path)
     out = []
@@ -115,34 +120,35 @@ def filter_lines(lines: List[Dict]) -> List[int]:
     return list(to_delete)
 
 
-def assign_lines_to_zones(detections: List[Dict]) -> Dict[str, List[Dict]]:
+def assign_lines_to_zones(detections: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """Assign lines to zones using maximum IoU."""
     zones = [d for d in detections if d["label"].endswith("Zone")]
     lines = [d for d in detections if d["label"].endswith("Line")]
 
-    assignments = {str(i): [] for i in range(len(zones))}
-
+    zones = [{"idx": idx, **zone} for (idx, zone) in enumerate(zones)]
+    lines = [{"idx": idx, **line} for (idx, line) in enumerate(lines)]
     for line in lines:
         best_idx = -1
         best_intersection = 0
-        for idx, zone in enumerate(zones):
+        for zone in zones:
             current_intersection = relative_intersection(line["bbox"], zone["bbox"])
             if current_intersection > best_intersection:
                 best_intersection = current_intersection
-                best_idx = idx
+                best_idx = zone["idx"]
         if best_idx != -1:
-            assignments[str(best_idx)].append(line)
+            line["zone"] = best_idx
 
-    return {"zones": zones, "assignments": assignments}
+    return zones, lines
 
 
-def bbox_to_polygon(bbox: List[float]) -> str:
+def bbox_to_polygon(bbox: List[float]) -> List[int]:
     """Convert a bbox to a 4-point polygon string for ALTO."""
     x1, y1, x2, y2 = map(int, bbox)
-    return f"{x1} {y1} {x2} {y1} {x2} {y2} {x1} {y2}"
+    return [x1, y1, x2, y1, x2, y2, x1, y2]
+    #return f"{x1} {y1} {x2} {y1} {x2} {y2} {x1} {y2}"
 
 
-def bbox_baseline(bbox: List[float], num_points: int = 10) -> str:
+def bbox_baseline(bbox: List[float], num_points: int = 10) -> List[int]:
     """
     Generate a baseline from left to right, in the middle of the bbox,
     as a space-separated string of x,y points.
@@ -154,11 +160,11 @@ def bbox_baseline(bbox: List[float], num_points: int = 10) -> str:
     # points = [f"{x},{center_y}" for x in xs]
     # return " ".join(points)
     x1, y1, x2, y2 = map(int, bbox)
-    center_y = (y1 + y2) // 2
-    return f"{x1} {center_y} {x2} {center_y}"
+    center_y = int((y1 + y2) // 2)
+    return [x1, center_y, x2, center_y]  #f"{x1} {center_y} {x2} {center_y}"
 
 
-def create_alto(zones: List[Dict], assignments: Dict[str, List[Dict]], image_path: str, wh: Tuple[int, int]) -> etree._Element:
+def create_alto(zones: List[Dict], lines: List[Dict], image_path: str, wh: Tuple[int, int]) -> etree._Element:
     """Generate ALTO XML from zones and lines."""
 
     # Build tag registry for all unique labels
@@ -172,13 +178,12 @@ def create_alto(zones: List[Dict], assignments: Dict[str, List[Dict]], image_pat
             tag_registry[label] = tag_id
             tags.add((tag_id, label, "block type"))
     
-    for line_list in assignments.values():
-        for line in line_list:
-            label = line["label"]
-            if label not in tag_registry:
-                tag_id = create_tag_id(label, "LT")
-                tag_registry[label] = tag_id
-                tags.add((tag_id, label, "line type"))
+    for line in lines:
+        label = line["label"]
+        if label not in tag_registry:
+            tag_id = create_tag_id(label, "LT")
+            tag_registry[label] = tag_id
+            tags.add((tag_id, label, "line type"))
     
     NSMAP = {
         None: "http://www.loc.gov/standards/alto/ns-v4#",
@@ -211,36 +216,165 @@ def create_alto(zones: List[Dict], assignments: Dict[str, List[Dict]], image_pat
 
     print_space = etree.SubElement(page, "PrintSpace")
 
-    # Sort zones top-to-bottom then left-to-right
-    # zone_order = sorted(enumerate(zones), key=lambda z: (z[1]['bbox'][1], z[1]['bbox'][0]))
-    zones = [{"idx": idx, **zone} for (idx, zone) in enumerate(zones)]
-    zones = sort_by_top_left_distance(zones)
     # return
-    for zone in zones:
-        x1, y1, x2, y2 = map(int, zone['bbox'])
-        tb = etree.SubElement(print_space, "TextBlock", ID=f"zone_{zone['idx']}", HPOS=str(x1), VPOS=str(y1),
-                              WIDTH=str(x2 - x1), HEIGHT=str(y2 - y1),TAGREFS=tag_registry[zone["label"]])
-        shape = etree.SubElement(tb, "Shape")
-        etree.SubElement(shape, "Polygon", POINTS=bbox_to_polygon(zone["bbox"]))
-        # for line in sorted(assignments[str(idx)], key=lambda l: (l["bbox"][1], l["bbox"][0])):
-        for line in sort_by_top_left_distance(assignments[str(zone["idx"])]):
-            lx1, ly1, lx2, ly2 = map(int, line["bbox"])
-            tl = etree.SubElement(
-                tb,
-                "TextLine",
-                ID=str(uuid.uuid4()),
-                HPOS=str(lx1),
-                VPOS=str(ly1),
-                WIDTH=str(lx2 - lx1),
-                HEIGHT=str(ly2 - ly1),
-                BASELINE=bbox_baseline(line["bbox"]),
-                TAGREFS=tag_registry[line["label"]]
-            )
-            # baseline = etree.SubElement(tl, "Baseline", )
-            shape = etree.SubElement(tl, "Shape")
-            etree.SubElement(shape, "Polygon", POINTS=bbox_to_polygon(line["bbox"]))
+
+    def points_to_str(points: List[int]) -> str:
+        return " ".join([str(p) for p in points])
+
+    zone_elements = {}
+
+    for line in lines:
+        cur_zone_idx = line.get("zone")
+        if cur_zone_idx not in zone_elements:
+            if cur_zone_idx is None:
+                tb = etree.SubElement(print_space, "TextBlock", ID=f"zone_dummy")
+            else:
+                zone = zones[cur_zone_idx]
+                x1, y1, x2, y2 = map(int, zone['bbox'])
+                tb = etree.SubElement(print_space, "TextBlock", ID=f"zone_{zone['idx']}", HPOS=str(x1), VPOS=str(y1),
+                                      WIDTH=str(x2 - x1), HEIGHT=str(y2 - y1), TAGREFS=tag_registry[zone["label"]])
+                shape = etree.SubElement(tb, "Shape")
+                etree.SubElement(shape, "Polygon", POINTS=points_to_str(bbox_to_polygon(zone["bbox"])))
+            zone_elements[cur_zone_idx] = tb
+
+        lx1, ly1, lx2, ly2 = map(int, line["bbox"])
+        tl = etree.SubElement(
+            zone_elements[cur_zone_idx],
+            "TextLine",
+            ID=str(uuid.uuid4()),
+            HPOS=str(lx1),
+            VPOS=str(ly1),
+            WIDTH=str(lx2 - lx1),
+            HEIGHT=str(ly2 - ly1),
+            BASELINE=points_to_str(line["baseline"]),
+            TAGREFS=tag_registry[line["label"]]
+        )
+        shape = etree.SubElement(tl, "Shape")
+        etree.SubElement(shape, "Polygon", POINTS=points_to_str(bbox_to_polygon(line["bbox"])))
 
     return alto
+
+
+def sort_lines_and_regions(zones: List[Dict], lines: List[Dict], direction: str = "ltr"):
+    origin_box = [0, 0]  # Points of origin
+
+    def get_zone(line: Dict) -> Dict:
+        """ Given a line, returns its zone object """
+        return zones[line["zone"]]
+
+    def distance(x, y):
+        """ Compute Euclidean distance between to object, which is equivalent to .hypot ?"""
+        return math.sqrt(sum([(a - b) ** 2 for a, b in zip(x, y)]))
+
+    def poly_origin_pt(shape: List[Tuple[int, int]], read_direction_: str = None):
+        """ Find the origin point of a polygon """
+        return min(shape, key=lambda pt: distance(pt, origin_box))
+
+    def baseline_origin_pt(baseline_: List[Tuple[int, int]], read_direction_: str) -> Tuple[int, int]:
+        """Retrieve the baseline origin point"""
+        return baseline_[-1 if read_direction_ == "rtl" else 0]
+
+    def flat_list_to_tuple(points: List[int]) -> List[Tuple[int, int]]:
+        """ YOLO returns [x1 y1 x2 y2], we move it to [[x1, y1], [x2, y2]]"""
+        return [
+            (points[i], points[i + 1])
+            for i in range(0, len(points), 2)
+        ]
+
+    def get_origin_pt(element: Dict, read_direction_: str) -> Tuple[int, int]:
+        return (
+            baseline_origin_pt(flat_list_to_tuple(element["baseline"]), read_direction_)
+            if element.get("baseline")
+            else poly_origin_pt(flat_list_to_tuple(element["bbox"]))
+        )
+
+    def line_block_pk(line_: Dict) -> int:
+        """ Returns the PK of a zone linked to a line """
+        return line_.get("zone", 0)
+
+    def avg_line_height_column(y_origins_np, line_labels):
+        """ Return the min of the averages line heights of the columns"""
+        labels = np.unique(line_labels)
+        line_heights_list = []
+        for label in labels:
+            y_origins_column = y_origins_np[line_labels == label]
+            column_height = (
+                y_origins_column.max() - y_origins_column.min()
+            ) / y_origins_column.size
+            line_heights_list.append(column_height)
+        return min(line_heights_list)
+
+    def avg_line_height_block(lines_in_block, read_direction_):
+        """Returns the average line height in the block taking into account devising number of columns
+        based on x lines origins clustering. Key parameters of the algorithm:
+        x_cluster: tolerance used to gather lines in a column
+        line_height_decrease: scaling factor to avoid over gathering of lines"""
+        x_cluster, line_height_decrease = 0.1, 0.8
+
+        origins_np = np.array(
+            list(map(lambda line: get_origin_pt(line, read_direction_), lines_in_block))
+        )
+
+        # Devise the number of columns by performing DBSCAN clustering on x coordinate of line origins
+        x_origins_np = origins_np[:, 0].reshape(-1, 1)
+        scaler = preprocessing.MinMaxScaler()
+        scaler.fit(x_origins_np)
+        x_scaled = scaler.transform(x_origins_np)
+        clustering = DBSCAN(eps=x_cluster)
+        clustering.fit(x_scaled)
+
+        # Compute the average line size based on the guessed number of columns
+        y_origins_np = origins_np[:, 1]
+        return (
+            avg_line_height_column(y_origins_np, clustering.labels_)
+            * line_height_decrease
+        )
+
+    def avg_lines_heights_dict(lines, read_direction_):
+        """Returns a dictionary with block.pk (or 0 if None) as keys and average lines height
+        in the block as values"""
+        sorted_by_block = sorted(lines, key=line_block_pk)
+        organized_by_block = itertools.groupby(sorted_by_block, key=line_block_pk)
+
+        avg_heights = {}
+        for block_pk, lines_in_block in organized_by_block:
+            avg_heights[block_pk] = avg_line_height_block(
+                lines_in_block, read_direction_
+            )
+        return avg_heights
+
+    dict_avg_heights = avg_lines_heights_dict(lines, read_direction_=direction)
+
+    def cached_origin_pt(element) -> Tuple[int, int]:
+        """ Caches and retrieve the cached origin point of objects
+        """
+        if "origin_pt" not in element:
+            element["origin_pt"] = get_origin_pt(element, direction)
+        return element["origin_pt"]
+
+    def cmp_lines(a, b):
+        try:
+            if a.get("zone") != b.get("zone"):
+                pt1 = cached_origin_pt(get_zone(a)) if a.get("zone") else cached_origin_pt(a)
+                pt2 = cached_origin_pt(get_zone(b)) if b.get("zone") else cached_origin_pt(b)
+
+                # when comparing blocks we can use the distance
+                return distance(pt1, origin_box) - distance(pt2, origin_box)
+            else:
+                pt1 = cached_origin_pt(a)
+                pt2 = cached_origin_pt(b)
+
+                # # 2 lines more or less on the same level
+                avg_height = dict_avg_heights[line_block_pk(a)]
+                if abs(pt1[1] - pt2[1]) < avg_height:
+                    return distance(pt1, origin_box) - distance(pt2, origin_box)
+            return pt1[1] - pt2[1]
+        except TypeError as E:
+            return 0
+
+    # sort depending on the distance to the origin
+    lines = sorted(lines, key=functools.cmp_to_key(lambda a, b: cmp_lines(a, b)))
+    return zones, lines
 
 
 def save_alto_xml(alto_element: etree._Element, output_path: str):
@@ -270,8 +404,10 @@ def cli(image_paths: tuple[Path], model_path: Path, batch_size: int = 4, device:
         for image_path, (detections, wh) in zip(batch, batch_detections):
             output_path = Path(image_path).with_suffix('.xml')
             print(f"Processing {image_path} and saving to {output_path}")
-            result = assign_lines_to_zones(detections)
-            alto = create_alto(result["zones"], result["assignments"], os.path.basename(str(image_path)), wh)
+            zones, lines = assign_lines_to_zones(detections)
+            lines = [{**line, "baseline": bbox_baseline(line["bbox"])} for line in lines]
+            zones, lines = sort_lines_and_regions(zones, lines)
+            alto = create_alto(zones, lines, os.path.basename(str(image_path)), wh)
             save_alto_xml(alto, str(output_path))
 
 cli()
