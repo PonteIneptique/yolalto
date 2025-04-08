@@ -362,14 +362,14 @@ def sort_lines_and_regions(zones: List[Dict], lines: List[Dict], direction: str 
                 return distance(pt1, origin_box) - distance(pt2, origin_box)
             else:
                 pt1 = cached_origin_pt(a)
-                pt2 = cached_origin_pt(a)
+                pt2 = cached_origin_pt(b)
 
                 # # 2 lines more or less on the same level
                 avg_height = dict_avg_heights[line_block_pk(a)]
                 if abs(pt1[1] - pt2[1]) < avg_height:
                     return distance(pt1, origin_box) - distance(pt2, origin_box)
             return pt1[1] - pt2[1]
-        except TypeError:  # invalid line
+        except TypeError as E:
             return 0
 
     # sort depending on the distance to the origin
