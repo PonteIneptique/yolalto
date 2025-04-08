@@ -9,6 +9,7 @@ setup(
         "ultralytics",
         "lxml",
         "click",
+        "scikit-learn"
     ],
     entry_points={
         "console_scripts": [
