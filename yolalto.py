@@ -1,6 +1,7 @@
 """
 Requirements: `shapely`, `ultralytics`, `lxml`, `click`
 """
+
 from ultralytics import YOLO
 from lxml import etree
 import itertools
@@ -383,6 +384,25 @@ def save_alto_xml(alto_element: etree._Element, output_path: str):
     tree.write(output_path, pretty_print=True, xml_declaration=True, encoding="UTF-8")
 
 
+def remove_duplicates(lines: List[Dict]) -> List[Dict]:
+    bboxes = {idx: line["bbox"] for idx, line in enumerate(lines)}
+    to_delete = set()
+    checked_pairs = set()
+
+    for (id1, box1), (id2, box2) in itertools.combinations(bboxes.items(), 2):
+        pair_key = tuple(sorted((id1, id2)))
+        if pair_key in checked_pairs:
+            continue
+        checked_pairs.add(pair_key)
+        score = iou(box1, box2)
+        if score > 0.5:
+            # Delete the line with the smaller x_min
+            delete_id = id1 if box1[0] < box2[0] else id2
+            to_delete.add(delete_id)
+
+    return [line for idx, line in enumerate(lines) if idx not in to_delete]
+
+
 @click.command()
 @click.argument('image_paths', type=click.Path(exists=True, path_type=Path), nargs=-1)
 @click.argument('model_path', type=click.Path(exists=True, path_type=Path))
@@ -405,6 +425,7 @@ def cli(image_paths: tuple[Path], model_path: Path, batch_size: int = 4, device:
             output_path = Path(image_path).with_suffix('.xml')
             print(f"Processing {image_path} and saving to {output_path}")
             zones, lines = assign_lines_to_zones(detections)
+            lines = remove_duplicates(lines)
             lines = [{**line, "baseline": bbox_baseline(line["bbox"])} for line in lines]
             zones, lines = sort_lines_and_regions(zones, lines)
             alto = create_alto(zones, lines, os.path.basename(str(image_path)), wh)
