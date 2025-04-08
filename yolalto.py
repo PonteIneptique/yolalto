@@ -234,7 +234,7 @@ def create_alto(zones: List[Dict], lines: List[Dict], image_path: str, wh: Tuple
                 tb = etree.SubElement(print_space, "TextBlock", ID=f"zone_{zone['idx']}", HPOS=str(x1), VPOS=str(y1),
                                       WIDTH=str(x2 - x1), HEIGHT=str(y2 - y1), TAGREFS=tag_registry[zone["label"]])
                 shape = etree.SubElement(tb, "Shape")
-                etree.SubElement(shape, "Polygon", POINTS=points_to_str(bbox_to_polygon(line["bbox"])))
+                etree.SubElement(shape, "Polygon", POINTS=points_to_str(bbox_to_polygon(zone["bbox"])))
             zone_elements[cur_zone_idx] = tb
 
         lx1, ly1, lx2, ly2 = map(int, line["bbox"])
