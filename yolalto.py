@@ -215,7 +215,7 @@ def create_alto(zones: List[Dict], lines: List[Dict], image_path: str, wh: Tuple
     layout = etree.SubElement(alto, "Layout")
     page = etree.SubElement(layout, "Page", ID="page1", PHYSICAL_IMG_NR="1", HEIGHT=str(wh[1]), WIDTH=str(wh[0]))
 
-    print_space = etree.SubElement(page, "PrintSpace")
+    print_space = etree.SubElement(page, "PrintSpace", HEIGHT=str(wh[1]), WIDTH=str(wh[0]), VPOS="0", HPOS="0")
 
     # return
 
